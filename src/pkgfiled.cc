@@ -1,31 +1,60 @@
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <archive.h>
+#include <fcntl.h>
 #include <getopt.h>
-#include <systemd/sd-event.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <utime.h>
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <future>
+#include <initializer_list>
+#include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "event_handler.hh"
+
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
 
 #include "archive_converter.hh"
 #include "compress.hh"
+#include "event_handler.hh"
+
+// Define signal numbers if not already defined
+#ifndef SIGUSR1
+#define SIGUSR1 10
+#endif
+
+#ifndef SIGUSR2
+#define SIGUSR2 12
+#endif
 
 namespace fs = std::filesystem;
 
 namespace {
 
 constexpr std::string_view kFilesExt = ".files";
-
-void BlockSignals(std::initializer_list<int> signums, sigset_t* saved) {
-  sigset_t ss;
-  for (auto signum : signums) {
-    sigaddset(&ss, signum);
-  }
-
-  sigprocmask(SIG_BLOCK, &ss, saved);
-}
 
 bool NeedsUpdate(const fs::path& subject, fs::file_time_type mtime) {
   std::error_code ec;
@@ -55,37 +84,69 @@ class Pkgfiled {
   };
 
   Pkgfiled(std::string_view watch_path, std::string_view pkgfile_cache,
-           Options options)
+           Options options, int* error = nullptr)
       : watch_path_(watch_path),
         pkgfile_cache_(pkgfile_cache),
         options_(options) {
+    if (error) *error = 0;
+    
+    // Initialize event handler
+    event_handler_ = EventHandler::Create();
+    if (!event_handler_) {
+      if (error) *error = 1;
+      return;
+    }
+
+    // Setup inotify watch
+    if (!event_handler_->AddFileWatch(
+            watch_path_, [this](const std::filesystem::path& path) {
+              if (path.extension() == kFilesExt) {
+                RepackRepo(path.filename());
+              }
+            })) {
+      if (error) *error = 2;
+      return;
+    }
+
+    // Block signals that we'll handle asynchronously
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, &saved_ss_);
+
+    // Setup signal handlers
     const int shutdown_signal = isatty(fileno(stdin)) ? SIGINT : SIGTERM;
+    
+    if (!event_handler_->AddSignalHandler(shutdown_signal, [this]() {
+          fprintf(stderr, "Termination signal received, shutting down\n");
+          event_handler_->Stop();
+        })) {
+      if (error) *error = 3;
+      return;
+    }
 
-    BlockSignals({shutdown_signal, SIGUSR1, SIGUSR2}, &saved_ss_);
+    if (!event_handler_->AddSignalHandler(SIGUSR1, [this]() {
+          fprintf(stderr, "SIGUSR1 received, repacking repos (force=false)\n");
+          Sync(false);
+        })) {
+      if (error) *error = 4;
+      return;
+    }
 
-    sd_event_default(&sd_event_);
-
-    sd_event_add_inotify(sd_event_, &inotify_source_, watch_path_.c_str(),
-                         IN_MOVED_TO, &Pkgfiled::OnInotifyEvent, this);
-    sd_event_source_set_priority(inotify_source_, SD_EVENT_PRIORITY_IMPORTANT);
-
-    sd_event_add_signal(sd_event_, &sigterm_source_, shutdown_signal,
-                        &Pkgfiled::OnSignalEvent, this);
-    sd_event_source_set_priority(sigterm_source_, SD_EVENT_PRIORITY_IDLE);
-
-    sd_event_add_signal(sd_event_, &sigusr1_source_, SIGUSR1,
-                        &Pkgfiled::OnSignalEvent, this);
-    sd_event_add_signal(sd_event_, &sigusr2_source_, SIGUSR2,
-                        &Pkgfiled::OnSignalEvent, this);
+    if (!event_handler_->AddSignalHandler(SIGUSR2, [this]() {
+          fprintf(stderr, "SIGUSR2 received, repacking repos (force=true)\n");
+          Sync(true);
+        })) {
+      if (error) *error = 5;
+      return;
+    }
   }
 
   ~Pkgfiled() {
-    sd_event_source_unref(inotify_source_);
-    sd_event_source_unref(sigterm_source_);
-    sd_event_source_unref(sigusr1_source_);
-    sd_event_source_unref(sigusr2_source_);
-    sd_event_unref(sd_event_);
-
+    // Restore original signal mask
     sigprocmask(SIG_SETMASK, &saved_ss_, nullptr);
   }
 
@@ -96,7 +157,7 @@ class Pkgfiled {
       return 0;
     }
 
-    return sd_event_loop(sd_event_);
+    return event_handler_->Run();
   }
 
   int Sync(bool force_update) {
@@ -156,56 +217,12 @@ class Pkgfiled {
     return ok;
   }
 
-  int OnInotifyEvent(const struct inotify_event* event) {
-    const fs::path changed_path(event->name);
-    if (changed_path.extension() != kFilesExt) {
-      return 0;
-    }
-
-    RepackRepo(changed_path);
-
-    return 0;
-  }
-
-  static int OnInotifyEvent(sd_event_source*, const struct inotify_event* event,
-                            void* userdata) {
-    return static_cast<Pkgfiled*>(userdata)->OnInotifyEvent(event);
-  }
-
-  int OnSignalEvent(const struct signalfd_siginfo* si) {
-    switch (si->ssi_signo) {
-      case SIGTERM:
-      case SIGINT:
-        fprintf(stderr, "%s received, shutting down\n",
-                strsignal(si->ssi_signo));
-        sd_event_exit(sd_event_, 0);
-        break;
-      case SIGUSR1:
-      case SIGUSR2:
-        bool force = si->ssi_signo == SIGUSR2;
-        fprintf(stderr, "%s received, repacking repos (force=%s)\n",
-                strsignal(si->ssi_signo), force ? "true" : "false");
-        Sync(force);
-        break;
-    }
-
-    return 0;
-  }
-
-  static int OnSignalEvent(sd_event_source*, const struct signalfd_siginfo* si,
-                           void* userdata) {
-    return static_cast<Pkgfiled*>(userdata)->OnSignalEvent(si);
-  }
+  // Event handler is now managed by the EventHandler class
 
   fs::path watch_path_;
   fs::path pkgfile_cache_;
   Options options_;
-
-  sd_event* sd_event_;
-  sd_event_source* inotify_source_;
-  sd_event_source* sigterm_source_;
-  sd_event_source* sigusr1_source_;
-  sd_event_source* sigusr2_source_;
+  std::unique_ptr<EventHandler> event_handler_;
   sigset_t saved_ss_{};
 };
 
@@ -214,39 +231,48 @@ class Pkgfiled {
 namespace {
 
 void Usage() {
-  fputs("pkgfiled " PACKAGE_VERSION
-        "\nUsage: pkgfiled [options] pacman_source pkgfile_dest\n\n",
-        stdout);
-  fputs(
+  std::string version = "pkgfiled ";
+#ifdef PACKAGE_VERSION
+  version += PACKAGE_VERSION;
+#endif
+  version += "\nUsage: pkgfiled [options] pacman_source pkgfile_dest\n\n";
+  fputs(version.c_str(), stdout);
+  
+  const char* help_text =
       "  -f, --force             repack all repos on initial sync\n"
       "  -o, --oneshot           exit after initial sync \n"
       "  -z, --compress[=type]   compress downloaded repos\n\n"
       "  -h, --help              display this help and exit\n"
-      "  -V, --version           display the version and exit\n\n",
-      stdout);
+      "  -V, --version           display the version and exit\n\n";
+  fputs(help_text, stdout);
 }
 
-void Version(void) { fputs("pkgfiled v" PACKAGE_VERSION "\n", stdout); }
+void Version() {
+  std::string version = "pkgfiled v";
+#ifdef PACKAGE_VERSION
+  version += PACKAGE_VERSION;
+#endif
+  version += "\n";
+  fputs(version.c_str(), stdout);
+}
 
 std::optional<pkgfile::Pkgfiled::Options> ParseOpts(int* argc, char*** argv) {
-  static constexpr char kShortOpts[] = "hofVz:";
-  static constexpr struct option kLongOpts[] = {
-      // clang-format off
-      { "oneshot",    no_argument,        0, 'o' },
-      { "help",       no_argument,        0, 'h' },
-      { "force",      no_argument,        0, 'f' },
-      { "compress",   required_argument,  0, 'z' },
-      { "version",    required_argument,  0, 'V' },
-      { 0, 0, 0, 0 },
-      // clang-format on
+  const char* kShortOpts = "hofVz:";
+  const struct option kLongOpts[] = {
+      {"help", no_argument, nullptr, 'h'},
+      {"oneshot", no_argument, nullptr, 'o'},
+      {"force", no_argument, nullptr, 'f'},
+      {"version", no_argument, nullptr, 'V'},
+      {"compress", required_argument, nullptr, 'z'},
+      {nullptr, 0, nullptr, 0},
   };
 
   pkgfile::Pkgfiled::Options opts;
-  for (;;) {
-    int opt = getopt_long(*argc, *argv, kShortOpts, kLongOpts, nullptr);
-    if (opt < 0) {
-      break;
-    }
+  // Reset getopt state
+  optind = 0;
+  
+  int opt;
+  while ((opt = getopt_long(*argc, *argv, kShortOpts, kLongOpts, nullptr)) != -1) {
 
     switch (opt) {
       case 'h':
@@ -277,8 +303,9 @@ std::optional<pkgfile::Pkgfiled::Options> ParseOpts(int* argc, char*** argv) {
     }
   }
 
-  *argc -= optind - 1;
-  *argv += optind - 1;
+  // Adjust argc and argv to skip processed options
+  *argc -= optind;
+  *argv += optind;
 
   return opts;
 }
@@ -296,5 +323,22 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  return pkgfile::Pkgfiled(argv[1], argv[2], options.value()).Run();
+  int error = 0;
+  pkgfile::Pkgfiled pkgfiled(argv[1], argv[2], options.value(), &error);
+  
+  if (error != 0) {
+    const char* error_msg;
+    switch (error) {
+      case 1: error_msg = "Failed to create event handler"; break;
+      case 2: error_msg = "Failed to add file watch"; break;
+      case 3: error_msg = "Failed to add shutdown signal handler"; break;
+      case 4: error_msg = "Failed to add SIGUSR1 handler"; break;
+      case 5: error_msg = "Failed to add SIGUSR2 handler"; break;
+      default: error_msg = "Unknown error initializing pkgfiled";
+    }
+    fprintf(stderr, "error: %s\n", error_msg);
+    return 1;
+  }
+
+  return pkgfiled.Run();
 }

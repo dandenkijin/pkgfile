@@ -161,7 +161,7 @@ class LibeventHandler : public EventHandler {
   bool IsValid() const override { return event_base_ != nullptr; }
 
  private:
-  static void OnInotifyEvent(evutil_socket_t fd, short events, void* arg) {
+  static void OnInotifyEvent(evutil_socket_t fd, [[maybe_unused]] short events, void* arg) {
     auto* self = static_cast<LibeventHandler*>(arg);
     char buf[4096] __attribute__((aligned(alignof(struct inotify_event))));
     const struct inotify_event* event;
@@ -176,7 +176,7 @@ class LibeventHandler : public EventHandler {
     }
   }
 
-  static void OnSignal(evutil_socket_t sig, short events, void* arg) {
+  static void OnSignal(evutil_socket_t sig, [[maybe_unused]] short events, void* arg) {
     auto* self = static_cast<LibeventHandler*>(arg);
     auto it = self->signal_handlers_.find(sig);
     if (it != self->signal_handlers_.end()) {

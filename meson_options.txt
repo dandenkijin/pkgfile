@@ -3,7 +3,19 @@ option('cachedir',
        value : '/var/cache/pkgfile',
        description : 'default directory to store pkgfile data')
 
+option('event_backend',
+       type : 'combo',
+       value : 'libevent',
+       choices : ['libevent', 'systemd'],
+       description : 'Event loop backend to use (libevent or systemd)')
+
 option('systemd_units',
        type : 'boolean',
-       value : true,
+       value : false,
        description : 'install systemd units to system unit directory')
+
+# Backward compatibility
+option('systemd',
+       type : 'boolean',
+       value : false,
+       description : 'DEPRECATED: Use -Devent_backend=systemd instead')

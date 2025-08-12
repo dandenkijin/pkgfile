@@ -4,7 +4,11 @@ project(
     version: '24',
     license: 'MIT',
     meson_version: '>=0.56',
-    default_options: ['cpp_std=c++20', 'warning_level=3', 'prefix=/usr'],
+    default_options: [
+        'cpp_std=c++20',
+        'warning_level=3',
+        'prefix=/usr',
+    ],
 )
 
 conf = configuration_data()
@@ -31,15 +35,64 @@ add_project_arguments(
 libpcre = dependency('libpcre', version: '>= 8.30')
 libarchive = dependency('libarchive', version: '>= 3.2.0')
 libcurl = dependency('libcurl')
-libsystemd = dependency('libsystemd')
 pthreads = dependency('threads')
 stdcppfs = cpp.find_library('stdc++fs')
 gtest = dependency('gtest', required: false)
 gmock = dependency('gmock', required: false)
 
+# Default to libevent if no backend is specified
+event_backend = get_option('event_backend')
+
+# Handle deprecated 'systemd' option
+if get_option('systemd')
+  warning('The "systemd" option is deprecated. Use "-Devent_backend=systemd" instead.')
+  if event_backend != 'libevent'
+    error('Cannot specify both "systemd" option and "event_backend" option')
+  endif
+  event_backend = 'systemd'
+endif
+
+# Initialize variables
+pkgfiled_deps = []
+
+# Check for required dependencies based on selected backend
+if event_backend == 'systemd'
+  libsystemd = dependency('libsystemd', required: true)
+  if not libsystemd.found()
+    error('Systemd support was selected but libsystemd was not found')
+  endif
+  pkgfiled_deps += [libsystemd]
+  add_project_arguments('-DHAVE_SYSTEMD', language: 'cpp')
+  message('Using systemd event backend')
+  
+  # Systemd units are only relevant if systemd is enabled
+  if get_option('systemd_units')
+    warning('systemd_units option is enabled, but it has no effect when not using systemd backend')
+  endif
+else
+  libevent = dependency('libevent', required: true)
+  if not libevent.found()
+    error('Libevent is required for the libevent backend')
+  endif
+  pkgfiled_deps += [libevent]
+  add_project_arguments('-DHAVE_LIBEVENT', language: 'cpp')
+  message('Using libevent backend')
+  
+  if get_option('systemd_units')
+    warning('systemd_units option is enabled, but it has no effect when not using systemd backend')
+  endif
+endif
+
 pod2man = find_program('pod2man')
 pkgconfig = find_program('pkg-config')
 mkdir_p = 'mkdir -p $DESTDIR/@0@'
+
+# Add compiler arguments based on systemd/libevent selection
+if event_backend == 'systemd'
+  add_project_arguments('-DHAVE_SYSTEMD', language: 'cpp')
+else
+  add_project_arguments('-DHAVE_LIBEVENT', language: 'cpp')
+endif
 
 libcommon = static_library(
     'pkgfile',
@@ -49,6 +102,7 @@ libcommon = static_library(
     src/archive_io.cc src/archive_io.hh
     src/archive_reader.cc src/archive_reader.hh
     src/compress.cc src/compress.hh
+    src/event_handler.cc src/event_handler.hh
     src/filter.cc src/filter.hh
     src/repo.cc src/repo.hh
     src/result.cc src/result.hh
@@ -78,11 +132,18 @@ executable(
     install: true,
 )
 
+pkgfiled_deps = [stdcppfs]
+if event_backend == 'systemd'
+  pkgfiled_deps += [libsystemd]
+else
+  pkgfiled_deps += [libevent]
+endif
+
 executable(
     'pkgfiled',
     'src/pkgfiled.cc',
     link_with: [libcommon],
-    dependencies: [libsystemd, stdcppfs],
+    dependencies: pkgfiled_deps,
     install: true,
 )
 
